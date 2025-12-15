@@ -85,15 +85,10 @@ def check_file_exists(table_name: str, file_hash: str):
 # 初始化資料庫
 init_db()
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/")
 def read_root():
-    """前端管理界面"""
-    return """
-    <!DOCTYPE html>
-    <html lang="zh-TW">
-    ...（把前面的 HTML 代碼貼在這裡）...
-    </html>
-    """
+    return {"message": "Excel Import API is running"}
+
 
 
 # ==================== 上傳 Excel 的 API ====================
@@ -319,7 +314,7 @@ def get_stats():
 
 # ==================== 前端頁面 ====================
 
-@app.get("/ui", response_class=HTMLResponse)
+@app.get("/", response_class=HTMLResponse)
 def get_frontend():
     """前端管理界面"""
     return """
@@ -991,6 +986,7 @@ def get_frontend():
     </body>
     </html>
     """
+
 
 if __name__ == "__main__":
     import uvicorn
