@@ -85,9 +85,6 @@ def check_file_exists(table_name: str, file_hash: str):
 # 初始化資料庫
 init_db()
 
-@app.get("/")
-def read_root():
-    return {"message": "Excel Import API is running"}
 
 
 
