@@ -1,14 +1,14 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import sqlite3
 import json
 import os
 from datetime import datetime
 import hashlib
+from pathlib import Path
 
-app = FastAPI(title="Excel Import API")
+app = FastAPI(title="Excel Import API with SQLite")
 
 # CORS 設置
 app.add_middleware(
@@ -19,18 +19,44 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 資料庫連接配置
-DB_CONFIG = {
-    "host": os.getenv("DB_HOST", "sjc1.clusters.zeabur.com"),
-    "port": int(os.getenv("DB_PORT", "5432")),
-    "user": os.getenv("DB_USER", "root"),
-    "password": os.getenv("DB_PASSWORD", "Ig30Hlx5Uz7L8pyc9CbtK2EFG4XoM6i1"),
-    "database": os.getenv("DB_NAME", "zeabur"),
-}
+# SQLite 資料庫文件路徑
+DB_PATH = "/data/excel_import.db"
+os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
 def get_db_connection():
     """獲取資料庫連接"""
-    return psycopg2.connect(**DB_CONFIG)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    """初始化資料庫，建立表"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    tables = [
+        "provincial_operations",
+        "parts_sales",
+        "repair_income_details",
+        "technician_performance"
+    ]
+    
+    for table_name in tables:
+        cursor.execute(f"""
+            CREATE TABLE IF NOT EXISTS {table_name} (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_name TEXT,
+                row_number INTEGER,
+                data TEXT,
+                file_hash TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+    
+    conn.commit()
+    cursor.close()
+    conn.close()
 
 def calculate_file_hash(file_content):
     """計算文件的 hash 值"""
@@ -40,10 +66,10 @@ def check_file_exists(table_name: str, file_hash: str):
     """檢查文件是否已上傳過"""
     try:
         conn = get_db_connection()
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor = conn.cursor()
         
         cursor.execute(
-            f"SELECT id, file_name, created_at FROM {table_name} WHERE file_hash = %s LIMIT 1",
+            f"SELECT id, file_name, created_at FROM {table_name} WHERE file_hash = ? LIMIT 1",
             (file_hash,)
         )
         result = cursor.fetchone()
@@ -51,13 +77,16 @@ def check_file_exists(table_name: str, file_hash: str):
         cursor.close()
         conn.close()
         
-        return result
+        return dict(result) if result else None
     except:
         return None
 
+# 初始化資料庫
+init_db()
+
 @app.get("/")
 def read_root():
-    return {"message": "Excel Import API is running"}
+    return {"message": "Excel Import API with SQLite is running"}
 
 # ==================== 上傳 Excel 的 API ====================
 
@@ -113,7 +142,7 @@ async def upload_excel(file: UploadFile, table_name: str, allow_duplicate: bool 
             data_dict = row.where(pd.notna(row), None).to_dict()
             
             cursor.execute(
-                f"INSERT INTO {table_name} (file_name, row_number, data, file_hash) VALUES (%s, %s, %s, %s)",
+                f"INSERT INTO {table_name} (file_name, row_number, data, file_hash) VALUES (?, ?, ?, ?)",
                 (file.filename, index + 1, json.dumps(data_dict, ensure_ascii=False, default=str), file_hash)
             )
             inserted_count += 1
@@ -150,13 +179,13 @@ def get_data(table_name: str, limit: int = 100, offset: int = 0, file_name: str 
             raise HTTPException(status_code=400, detail="Invalid table name")
         
         conn = get_db_connection()
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor = conn.cursor()
         
         # 構建查詢條件
         where_clause = ""
         params = []
         if file_name:
-            where_clause = "WHERE file_name = %s"
+            where_clause = "WHERE file_name = ?"
             params.append(file_name)
         
         # 查詢總數
@@ -165,10 +194,10 @@ def get_data(table_name: str, limit: int = 100, offset: int = 0, file_name: str 
         
         # 查詢數據
         cursor.execute(
-            f"SELECT id, file_name, row_number, data, created_at FROM {table_name} {where_clause} ORDER BY created_at DESC LIMIT %s OFFSET %s",
+            f"SELECT id, file_name, row_number, data, created_at FROM {table_name} {where_clause} ORDER BY created_at DESC LIMIT ? OFFSET ?",
             params + [limit, offset]
         )
-        rows = cursor.fetchall()
+        rows = [dict(row) for row in cursor.fetchall()]
         
         cursor.close()
         conn.close()
@@ -195,10 +224,10 @@ def get_single_row(table_name: str, id: int):
             raise HTTPException(status_code=400, detail="Invalid table name")
         
         conn = get_db_connection()
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor = conn.cursor()
         
         cursor.execute(
-            f"SELECT * FROM {table_name} WHERE id = %s",
+            f"SELECT * FROM {table_name} WHERE id = ?",
             (id,)
         )
         row = cursor.fetchone()
@@ -209,7 +238,7 @@ def get_single_row(table_name: str, id: int):
         if not row:
             raise HTTPException(status_code=404, detail="Data not found")
         
-        return {"status": "success", "data": row}
+        return {"status": "success", "data": dict(row)}
     
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -221,7 +250,7 @@ def get_all_tables_data(limit: int = 10):
     """查詢所有表的數據（統一視圖）"""
     try:
         conn = get_db_connection()
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor = conn.cursor()
         
         tables = {
             "provincial_operations": "全省營運數據",
@@ -235,10 +264,10 @@ def get_all_tables_data(limit: int = 10):
         for table_name, table_desc in tables.items():
             # 查詢每個表的最新數據
             cursor.execute(
-                f"SELECT id, file_name, row_number, data, created_at FROM {table_name} ORDER BY created_at DESC LIMIT %s",
+                f"SELECT id, file_name, row_number, data, created_at FROM {table_name} ORDER BY created_at DESC LIMIT ?",
                 (limit,)
             )
-            rows = cursor.fetchall()
+            rows = [dict(row) for row in cursor.fetchall()]
             
             # 查詢總數
             cursor.execute(f"SELECT COUNT(*) as total FROM {table_name}")
@@ -276,7 +305,7 @@ def update_data(table_name: str, id: int, updated_data: dict):
         
         # 更新 data 欄位
         cursor.execute(
-            f"UPDATE {table_name} SET data = %s, updated_at = %s WHERE id = %s",
+            f"UPDATE {table_name} SET data = ?, updated_at = ? WHERE id = ?",
             (json.dumps(updated_data, ensure_ascii=False, default=str), datetime.now(), id)
         )
         
@@ -301,7 +330,7 @@ def get_stats():
     """獲取所有表的統計信息"""
     try:
         conn = get_db_connection()
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor = conn.cursor()
         
         tables = ["provincial_operations", "parts_sales", "repair_income_details", "technician_performance"]
         stats = {}
