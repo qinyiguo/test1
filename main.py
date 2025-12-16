@@ -39,7 +39,7 @@ def init_db():
         "provincial_operations",
         "parts_sales",
         "repair_income_details",
-        "technician_performance"
+        "technician_performance",  # 新增 KPI 目標表
     ]
     
     for table_name in tables:
@@ -109,6 +109,11 @@ async def upload_repair_income(file: UploadFile = File(...), allow_duplicate: bo
 async def upload_technician_performance(file: UploadFile = File(...), allow_duplicate: bool = Query(False)):
     """上傳技師績效"""
     return await upload_excel(file, "technician_performance", allow_duplicate)
+
+@app.post("/upload/kpi_targets")
+async def upload_kpi_targets(file: UploadFile = File(...), allow_duplicate: bool = Query(False)):
+    """上傳 KPI 目標資料"""
+    return await upload_excel(file, "kpi_targets", allow_duplicate)
 
 async def upload_excel(file: UploadFile, table_name: str, allow_duplicate: bool = False):
     """通用 Excel 上傳函數"""
@@ -242,6 +247,270 @@ def get_single_row(table_name: str, id: int):
     
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+# ==================== KPI 分析查詢 API ====================
+
+from typing import Optional, List
+from pydantic import BaseModel
+
+class KPIQueryRequest(BaseModel):
+    """KPI 查詢請求模型"""
+    year: Optional[int] = None
+    month: Optional[int] = None
+    factory: Optional[List[str]] = None
+    salesperson: Optional[List[str]] = None
+    part_category: Optional[List[str]] = None
+    function_code: Optional[List[str]] = None
+    show_fields: List[str] = ["quantity", "amount"]  # 預設顯示數量和金額
+    group_by: str = "salesperson"  # 分組方式: salesperson, factory, part_category
+
+@app.post("/api/kpi/analysis")
+def analyze_kpi(query: KPIQueryRequest):
+    """
+    彈性 KPI 查詢分析
+    可依廠別、銷售人員、零件類別、功能碼等條件篩選
+    """
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # 查詢零件銷售數據
+        cursor.execute("SELECT id, data FROM parts_sales")
+        sales_records = cursor.fetchall()
+        
+        # 解析數據並篩選
+        filtered_data = []
+        for record in sales_records:
+            data = json.loads(record["data"])
+            
+            # 應用篩選條件
+            if query.factory and data.get("廠別") not in query.factory:
+                continue
+            if query.salesperson and data.get("銷售人員") not in query.salesperson:
+                continue
+            if query.part_category and data.get("零件類別") not in query.part_category:
+                continue
+            if query.function_code and data.get("功能碼") not in query.function_code:
+                continue
+            
+            # 時間篩選（如果數據中有日期欄位）
+            if query.year or query.month:
+                date_field = data.get("日期") or data.get("銷售日期")
+                if date_field:
+                    try:
+                        date_obj = pd.to_datetime(date_field)
+                        if query.year and date_obj.year != query.year:
+                            continue
+                        if query.month and date_obj.month != query.month:
+                            continue
+                    except:
+                        pass
+            
+            filtered_data.append(data)
+        
+        # 依分組方式統計
+        df = pd.DataFrame(filtered_data)
+        
+        if df.empty:
+            return {
+                "status": "success",
+                "message": "查無符合條件的數據",
+                "summary": {},
+                "details": []
+            }
+        
+        # 確保數值欄位為數字類型
+        numeric_fields = {
+            "quantity": "數量",
+            "amount": "金額",
+            "cost": "成本"
+        }
+        
+        for field_key, field_name in numeric_fields.items():
+            if field_name in df.columns:
+                df[field_name] = pd.to_numeric(df[field_name], errors='coerce').fillna(0)
+        
+        # 分組統計
+        group_field_map = {
+            "salesperson": "銷售人員",
+            "factory": "廠別",
+            "part_category": "零件類別",
+            "function_code": "功能碼"
+        }
+        
+        group_field = group_field_map.get(query.group_by, "銷售人員")
+        
+        if group_field not in df.columns:
+            raise HTTPException(status_code=400, detail=f"數據中沒有 {group_field} 欄位")
+        
+        # 執行分組統計
+        agg_dict = {}
+        if "quantity" in query.show_fields and "數量" in df.columns:
+            agg_dict["數量"] = "sum"
+        if "amount" in query.show_fields and "金額" in df.columns:
+            agg_dict["金額"] = "sum"
+        if "cost" in query.show_fields and "成本" in df.columns:
+            agg_dict["成本"] = "sum"
+        
+        grouped = df.groupby(group_field).agg(agg_dict).reset_index()
+        
+        # 查詢對應的目標
+        cursor.execute("SELECT id, data FROM kpi_targets")
+        target_records = cursor.fetchall()
+        
+        targets_dict = {}
+        for record in target_records:
+            target_data = json.loads(record["data"])
+            
+            # 匹配年月
+            if query.year and target_data.get("年份") != query.year:
+                continue
+            if query.month and target_data.get("月份") != query.month:
+                continue
+            
+            key = target_data.get(group_field)
+            if key:
+                targets_dict[key] = {
+                    "target_amount": float(target_data.get("目標金額", 0)),
+                    "weight": float(target_data.get("權重", 0))
+                }
+        
+        # 整合結果
+        details = []
+        for _, row in grouped.iterrows():
+            group_value = row[group_field]
+            result = {
+                query.group_by: group_value
+            }
+            
+            # 添加統計數據
+            if "數量" in row.index:
+                result["quantity"] = float(row["數量"])
+            if "金額" in row.index:
+                result["amount"] = float(row["金額"])
+            if "成本" in row.index:
+                result["cost"] = float(row["成本"])
+            
+            # 添加目標和達成率
+            if group_value in targets_dict:
+                target = targets_dict[group_value]
+                result["target_amount"] = target["target_amount"]
+                result["weight"] = target["weight"]
+                
+                if "amount" in result and target["target_amount"] > 0:
+                    result["achievement_rate"] = round(
+                        (result["amount"] / target["target_amount"]) * 100, 2
+                    )
+                else:
+                    result["achievement_rate"] = 0
+            else:
+                result["target_amount"] = 0
+                result["achievement_rate"] = 0
+            
+            details.append(result)
+        
+        # 依達成率排序並添加排名
+        details.sort(key=lambda x: x.get("achievement_rate", 0), reverse=True)
+        for rank, item in enumerate(details, 1):
+            item["rank"] = rank
+        
+        # 計算總計
+        summary = {
+            "total_records": len(filtered_data),
+            "groups": len(details)
+        }
+        
+        if "amount" in query.show_fields:
+            summary["total_amount"] = sum(d.get("amount", 0) for d in details)
+            summary["total_target"] = sum(d.get("target_amount", 0) for d in details)
+            if summary["total_target"] > 0:
+                summary["overall_achievement_rate"] = round(
+                    (summary["total_amount"] / summary["total_target"]) * 100, 2
+                )
+        
+        cursor.close()
+        conn.close()
+        
+        return {
+            "status": "success",
+            "summary": summary,
+            "details": details,
+            "query_conditions": {
+                "year": query.year,
+                "month": query.month,
+                "factory": query.factory,
+                "salesperson": query.salesperson,
+                "part_category": query.part_category,
+                "function_code": query.function_code,
+                "group_by": query.group_by
+            }
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/kpi/filters")
+def get_kpi_filters():
+    """
+    取得所有可用的篩選選項
+    用於前端動態生成下拉選單
+    """
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT data FROM parts_sales")
+        records = cursor.fetchall()
+        
+        # 收集所有唯一值
+        factories = set()
+        salespersons = set()
+        part_categories = set()
+        function_codes = set()
+        years = set()
+        months = set()
+        
+        for record in records:
+            data = json.loads(record["data"])
+            
+            if data.get("廠別"):
+                factories.add(data["廠別"])
+            if data.get("銷售人員"):
+                salespersons.add(data["銷售人員"])
+            if data.get("零件類別"):
+                part_categories.add(data["零件類別"])
+            if data.get("功能碼"):
+                function_codes.add(data["功能碼"])
+            
+            # 提取年月
+            date_field = data.get("日期") or data.get("銷售日期")
+            if date_field:
+                try:
+                    date_obj = pd.to_datetime(date_field)
+                    years.add(date_obj.year)
+                    months.add(date_obj.month)
+                except:
+                    pass
+        
+        cursor.close()
+        conn.close()
+        
+        return {
+            "status": "success",
+            "filters": {
+                "factories": sorted(list(factories)),
+                "salespersons": sorted(list(salespersons)),
+                "part_categories": sorted(list(part_categories)),
+                "function_codes": sorted(list(function_codes)),
+                "years": sorted(list(years), reverse=True),
+                "months": sorted(list(months))
+            }
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 # ==================== 修改數據的 API（管理者） ====================
 
